@@ -1,4 +1,4 @@
-<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found]){display:none!important}</style></head><body>
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
 <title>PDF Label Sorter</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=Public+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
 <style>
@@ -311,7 +311,7 @@
     <section class="card">
       <h2><span class="step-num">2</span>How the sort works</h2>
       <ol class="rules-list">
-        <li><span class="rule-n">01</span><p>The free bansuri gift (<code>BS-1</code>) and the small Krishna-charan add-on (<code>KC-1</code>) are ignored when counting how many real products are on a label.</p></li>
+        <li><span class="rule-n">01</span><p>An item priced exactly <code>0.00</code> is a free gift (any SKU: <code>R-5-NP</code>, <code>BS-1</code>, <code>KC-1</code>, trial perfumes) and is ignored when counting real products. Any item priced above 0 is a real product, even if its SKU is normally a gift.</p></li>
         <li><span class="rule-n">02</span><p>A label with exactly one real product files into that product's own SKU. A label with two or more real products goes into a shared <code>MIX</code> file instead.</p></li>
         <li><span class="rule-n">03</span><p>Inside every file, labels with the identical SKU combination sit together, then by order quantity.</p></li>
         <li><span class="rule-n">04</span><p>Any SKU that ends up with only 1–2 labels is pulled out of its own tiny file and combined with all the other 1–2 label SKUs into one shared <code>SINGLES</code> file.</p></li>
@@ -340,7 +340,7 @@
       </div>
       <div id="mixAppendix" hidden>
         <h3>What's inside MIX</h3>
-        <p>Each row is one label filed into MIX because it carries 2+ real products (BS-1 / KC-1 not counted).</p>
+        <p>Each row is one label filed into MIX because it carries 2+ real products (0.00 free gifts not counted).</p>
         <div class="table-scroll">
           <table>
             <thead><tr><th>AWB #</th><th>Products on this label</th></tr></thead>
@@ -350,10 +350,10 @@
       </div>
       <div id="singlesAppendix" hidden>
         <h3>What's inside SINGLES</h3>
-        <p>Each row is one SKU that only had 1–2 labels on its own, so it was folded into this shared file instead of getting a tiny file to itself.</p>
+        <p>Each row is one SKU that only had 1–2 labels on its own, so it was folded into this shared file instead of getting a tiny file to itself. You can still download any one of them on its own with its button.</p>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>SKU</th><th>Product</th><th>Labels</th></tr></thead>
+            <thead><tr><th>SKU</th><th>Product</th><th>Labels</th><th></th></tr></thead>
             <tbody id="singlesAppendixBody"></tbody>
           </table>
         </div>
@@ -447,7 +447,12 @@
   const { PDFDocument, PDFName, PDFDict, PDFArray, PDFRef, decodePDFRawStream, StandardFonts, rgb } = window.PDFLib;
 
   // ---------- constants (mirrors generate.py) ----------
-  const IGNORE_SKUS = new Set(['BS-1', 'KC-1']);
+  // A "free gift" is decided ONLY by price: an item whose line amount is
+  // exactly 0.00 is a free gift (any SKU: R-5-NP, BS-1, KC-1, trial perfumes...)
+  // and is ignored when counting real products. Anything priced above 0 is a
+  // real product. An unreadable price is treated as a real (paid) product.
+  // (Replaces the old fixed SKU-name list, which missed 'R-5-NP' vs 'R5-NP'.)
+  const isFree = (it) => it.free === true;
   const MIX_KEY = 'MIX';
   const SINGLES_KEY = 'SINGLES';
   const MIX_DIVIDER_NAME = 'MIX — mixed / combo orders (2+ products per label)';
@@ -466,7 +471,11 @@
   // raw per-fragment x/y positions bucketed into columns instead. See
   // parseFormatB() below.
   const FB_HEADER_RE = /^SKU\s+Item\s+Name\s+Qty\s+Amount\s*$/i;
-  const FB_ORDER_TOTAL_RE = /^Order\s*Total$/i;
+  // Some couriers (e.g. India Post / Ekart, as opposed to Blue Dart) put the
+  // order amount on the SAME line as "Order Total" instead of its own line —
+  // so this matches a line that *starts* with "Order Total" rather than
+  // requiring the whole line to be exactly that (added 2026-09-09).
+  const FB_ORDER_TOTAL_RE = /^Order\s*Total\b/i;
   const FB_AWB_RE = /Awb:\s*(\S+)/i;
   const FB_AMOUNT_NUM_RE = /([\d,]+\.\d{2})/;
   const FB_COL = { skuMax: 100, nameMax: 210, qtyMax: 240 };
@@ -646,11 +655,45 @@
   }
 
   // ---------- Format A parser: Dharmik/Delhivery export ----------
+  // A minority of Format A labels have a "Product Name" table (no "& SKU" in
+  // the header) with NO "SKU:" line under any item at all — the product has
+  // no SKU mapped in Delhivery's system for that order (added 2026-09-09,
+  // seen on a real batch: ~33/165 pages). Rather than silently dropping
+  // these labels, fall back to a pseudo-SKU derived from the cleaned product
+  // name so same-name orders still group together and nothing goes missing.
+  // Pseudo-SKUs are prefixed "NOSKU:" so they're never confused with a real
+  // catalog SKU. The free-gift/add-on line (normally BS-1/KC-1) has no SKU
+  // line either on these pages, so it's matched back to its real ignorable
+  // SKU by name first — otherwise every no-SKU label would wrongly count as
+  // a 2-real-product MIX order (the gift line would look like a second
+  // "real" product).
+  function pseudoSkuFromName(name) {
+    return 'NOSKU:' + cleanName(name).toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40);
+  }
+  const KNOWN_NOSKU_NAME_TO_SKU = [
+    { re: /silver\s*plated\s*bansuri\s*for\s*thakurji/i, sku: 'BS-1' },
+    { re: /krishna[\s-]?charan/i, sku: 'KC-1' },
+  ];
+  function resolveNoSku(name) {
+    for (const { re, sku } of KNOWN_NOSKU_NAME_TO_SKU) {
+      if (re.test(name)) return sku;
+    }
+    return pseudoSkuFromName(name);
+  }
+
   function parseFormatA(lines) {
     let awb = null;
     const items = [];
     let inTable = false;
     let pending = null;
+    const flushPending = () => {
+      if (pending) {
+        pending.sku = resolveNoSku(pending.name);
+        pending.noSku = true;
+        items.push(pending);
+        pending = null;
+      }
+    };
     for (const raw of lines) {
       const line = raw.trim();
       if (!line) continue;
@@ -658,11 +701,14 @@
         const m = AWB_RE_A.exec(line);
         if (m) awb = m[1];
       }
-      if (line.startsWith('Product Name & SKU')) {
+      // Matches both "Product Name & SKU" (normal) and the bare "Product
+      // Name" variant (SKU-less) headers.
+      if (line.startsWith('Product Name')) {
         inTable = true;
         continue;
       }
       if (line.startsWith('Return Address')) {
+        flushPending();
         inTable = false;
         continue;
       }
@@ -677,15 +723,20 @@
       }
       const im = ITEM_RE.exec(line);
       if (im) {
+        flushPending();
+        const _price = parseFloat(im[3].replace(/,/g, ''));
+        const _total = parseFloat(im[4].replace(/,/g, ''));
         pending = {
           name: im[1].trim(),
           qty: parseInt(im[2], 10),
-          price: parseFloat(im[3].replace(/,/g, '')),
-          total: parseFloat(im[4].replace(/,/g, '')),
+          price: _price,
+          total: _total,
+          free: _total === 0,
         };
         continue;
       }
     }
+    flushPending();
     if (!items.length) return null;
     return { awb, items };
   }
@@ -768,9 +819,14 @@
       if (!row.sku) continue;
       const name = mergeParts(row.nameParts) || row.sku;
       const qty = parseInt(mergeParts(row.qtyParts), 10) || 1;
-      const am = FB_AMOUNT_NUM_RE.exec(mergeParts(row.amtParts));
+      const amtText = mergeParts(row.amtParts);
+      const am = FB_AMOUNT_NUM_RE.exec(amtText);
       const amount = am ? parseFloat(am[1].replace(/,/g, '')) : 0;
-      items.push({ name, qty, price: amount, total: amount, sku: row.sku });
+      // Free only when an amount is actually printed AND it is zero
+      // ("Rs. 0", "0.00", "Rs. 0.0"); a missing/unreadable amount stays paid.
+      const am2 = /(\d[\d,]*(?:\.\d+)?)/.exec(amtText);
+      const free = !!am2 && parseFloat(am2[1].replace(/,/g, '')) === 0;
+      items.push({ name, qty, price: amount, total: amount, sku: row.sku, free });
     }
     if (!items.length) return null;
 
@@ -805,7 +861,8 @@
   function classify(items) {
     const maxTotal = Math.max(...items.map((it) => it.total));
     const top = items.find((it) => it.total === maxTotal);
-    const realItems = items.filter((it) => !IGNORE_SKUS.has(it.sku));
+    
+    const realItems = items.filter((it) => !isFree(it));
     const distinctReal = [...new Set(realItems.map((it) => it.sku))].sort();
     let groupKey, repItem;
     if (distinctReal.length > 1) {
@@ -813,10 +870,11 @@
       repItem = top;
     } else if (distinctReal.length === 1) {
       groupKey = distinctReal[0];
-      repItem = items.find((it) => it.sku === groupKey);
+      repItem = realItems.find((it) => it.sku === groupKey);
     } else {
-      groupKey = top.sku;
-      repItem = top;
+      // Every item is a 0.00 free gift (rare): the TOP item's SKU decides.
+      groupKey = items[0].sku;
+      repItem = items[0];
     }
     return {
       groupKey,
@@ -1182,7 +1240,7 @@
         let name, repPrice, qtyBreakdown;
         if (key === MIX_KEY) {
           repPrice = Math.max(...groupPages.map((p) => p.topPrice));
-          name = 'Mixed / combo orders — 2+ real products on one label (BS-1 gift & KC-1 add-on ignored when counting)';
+          name = 'Mixed / combo orders — 2+ real products on one label (0.00 free gifts ignored when counting)';
           qtyBreakdown = {};
         } else {
           const nameCounts = new Map();
@@ -1218,7 +1276,7 @@
           repPrice: Math.max(...smallGroups.map((g) => g.repPrice)),
           qtyBreakdown: {},
           pages: combinedPages,
-          memberSkus: smallGroups.map((g) => ({ sku: g.key, name: g.name, count: g.pages.length })),
+          memberSkus: smallGroups.map((g) => ({ sku: g.key, name: g.name, count: g.pages.length, pages: g.pages })),
         }]);
         log(smallGroups.length + ' SKU(s) had only 1-2 labels — combined into one SINGLES file (' + combinedPages.length + ' labels).');
       }
@@ -1244,6 +1302,14 @@
         const indices = g.pages.map((p) => p.page - 1);
         g.bytes = await buildPdfFromIndices(srcDoc, indices);
         g.filename = String(g.rank).padStart(2, '0') + '_' + safeFilename(g.key) + '_' + indices.length + 'labels.pdf';
+        // each SKU folded into SINGLES also gets its own downloadable file
+        if (g.memberSkus) {
+          for (const m of g.memberSkus) {
+            const mi = m.pages.map((p) => p.page - 1);
+            m.bytes = await buildPdfFromIndices(srcDoc, mi);
+            m.filename = safeFilename(m.sku) + '_' + mi.length + 'labels.pdf';
+          }
+        }
         built += indices.length;
         setProgress(50 + (built / pages.length) * 45);
         await yieldToUI();
@@ -1324,7 +1390,8 @@
       mixAppendix.hidden = false;
       const rows = mixGroup.pages
         .map((p) => {
-          const combo = [...new Set(p.items.map((it) => it.sku))].filter((s) => !IGNORE_SKUS.has(s)).sort().join(' + ');
+          const _real = p.items.filter((it) => !isFree(it));
+          const combo = [...new Set((_real.length ? _real : [p.items[0]]).map((it) => it.sku))].sort().join(' + ');
           return '<tr><td>' + escapeHtml(p.awb || '') + '</td><td>' + escapeHtml(combo) + '</td></tr>';
         })
         .join('');
@@ -1340,10 +1407,21 @@
       const rows = singlesGroup.memberSkus
         .map(
           (m) =>
-            '<tr><td><span class="sku-pill">' + escapeHtml(m.sku) + '</span></td><td>' + escapeHtml(m.name) + '</td><td class="num-cell">' + m.count + '</td></tr>'
+            '<tr><td><span class="sku-pill">' + escapeHtml(m.sku) + '</span></td><td>' + escapeHtml(m.name) + '</td><td class="num-cell">' + m.count + '</td><td><button class="dl-btn" data-single="' + escapeHtml(m.sku) + '">Download PDF</button></td></tr>'
         )
         .join('');
       $('singlesAppendixBody').innerHTML = rows;
+      $('singlesAppendixBody').querySelectorAll('button[data-single]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const m = singlesGroup.memberSkus.find((x) => x.sku === btn.getAttribute('data-single'));
+          if (!m || !m.bytes) return;
+          btn.disabled = true;
+          btn.textContent = 'Saving…';
+          await saveFile(m.filename, m.bytes, 'application/pdf');
+          btn.disabled = false;
+          btn.textContent = 'Download PDF';
+        });
+      });
     } else {
       singlesAppendix.hidden = true;
     }
